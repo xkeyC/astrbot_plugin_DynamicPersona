@@ -1,0 +1,52 @@
+{
+  "enabled": {
+    "description": "是否启用动态人格插件",
+    "type": "bool",
+    "default": true
+  },
+  "selector_provider_id": {
+    "description": "Selector LLM 使用的模型提供商（留空则使用会话当前模型）",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "建议选择一个轻量、快速的模型（如 qwen-turbo）以降低延迟，留空则与主对话使用同一模型",
+    "default": ""
+  },
+  "inject_mode": {
+    "description": "人格注入方式",
+    "type": "string",
+    "default": "replace",
+    "hint": "replace：完全替换 system_prompt（推荐）；prepend：将选中人格追加到原有 system_prompt 之前",
+    "options": ["replace", "prepend"]
+  },
+  "cache_ttl": {
+    "description": "Selector 结果缓存消息条数（同一会话中复用 N 条后才重新选择人格）",
+    "type": "int",
+    "default": 3,
+    "hint": "设为 0 则每次消息都重新调用 Selector LLM（精准但有额外延迟）"
+  },
+  "selector_prompt_extra": {
+    "description": "Selector 附加提示词（追加到 Selector 系统提示末尾，可用于微调选择偏好）",
+    "type": "text",
+    "default": "",
+    "hint": "例如：当用户使用中文时，优先选择更活泼的人格"
+  },
+  "persona_rules": {
+    "description": "动态人格规则列表（至少配置 2 条规则插件才会生效）",
+    "type": "list",
+    "hint": "每条规则绑定一个人格并描述该人格适合的使用场景，Selector LLM 将根据用户消息匹配最合适的一个",
+    "items": {
+      "persona_id": {
+        "description": "人格 ID",
+        "type": "string",
+        "_special": "select_persona",
+        "hint": "选择已在 AstrBot WebUI 人格管理页面中创建好的人格"
+      },
+      "scenario_desc": {
+        "description": "该人格适用场景描述（供 Selector LLM 参考）",
+        "type": "text",
+        "hint": "用自然语言描述该人格最适合的使用场景，越具体越准确。例如：用户聊天轻松打趣、玩梗、调侃时；用户在认真提问、请求技术解答、工作任务时",
+        "default": ""
+      }
+    }
+  }
+}
