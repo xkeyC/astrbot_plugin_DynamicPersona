@@ -31,32 +31,38 @@
     "hint": "例如：当用户使用中文时，优先选择更活泼的人格"
   },
   "persona_rules": {
-    "description": "动态人格规则列表（从已有人格中选择并配置，至少启用 2 个人格插件才会生效）",
-    "type": "list",
+    "description": "动态人格规则列表（至少启用 2 个人格插件才会生效）",
+    "type": "template_list",
     "hint": "从 AstrBot 人格列表中选择人格，为每个人格填写描述和适用场景，并决定是否启用",
-    "items": {
-      "rule_enabled": {
-        "description": "是否启用该人格规则",
-        "type": "bool",
-        "default": true
-      },
-      "persona_id": {
-        "description": "选择人格",
-        "type": "string",
-        "_special": "select_persona",
-        "hint": "从 AstrBot WebUI 人格管理页面中已创建的人格列表中选择"
-      },
-      "persona_desc": {
-        "description": "人格描述（该人格的身份与能力）",
-        "type": "text",
-        "hint": "描述该人格的角色定位和能力特征。例如：专业的计算机领域从业者，具有调用本机 shell 的能力，擅长代码调试与系统管理",
-        "default": ""
-      },
-      "scenario_desc": {
-        "description": "使用该人格的情况（何时应该切换到此人格）",
-        "type": "text",
-        "hint": "描述什么样的用户消息应该触发切换到此人格。例如：用户发出相对严肃的任务请求、知识询问或命令指示时启用该人格",
-        "default": ""
+    "templates": {
+      "persona_rule": {
+        "name": "人格规则",
+        "hint": "配置一条人格规则：选择人格、填写描述、设定使用场景",
+        "items": {
+          "rule_enabled": {
+            "description": "是否启用该人格规则",
+            "type": "bool",
+            "default": true
+          },
+          "persona_id": {
+            "description": "选择人格",
+            "type": "string",
+            "_special": "select_persona",
+            "hint": "从 AstrBot WebUI 人格管理页面中已创建的人格列表中选择"
+          },
+          "persona_desc": {
+            "description": "人格描述（该人格的身份与能力）",
+            "type": "text",
+            "hint": "描述该人格的角色定位和能力特征。例如：专业的计算机领域从业者，具有调用本机 shell 的能力，擅长代码调试与系统管理",
+            "default": ""
+          },
+          "scenario_desc": {
+            "description": "使用该人格的情况（何时应该切换到此人格）",
+            "type": "text",
+            "hint": "描述什么样的用户消息应该触发切换到此人格。例如：用户发出相对严肃的任务请求、知识询问或命令指示时启用该人格",
+            "default": ""
+          }
+        }
       }
     }
   }

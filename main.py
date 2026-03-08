@@ -48,7 +48,7 @@ _SELECTOR_USER_PROMPT_TMPL = """可选人格列表：
     "astrbot_plugin_DynamicPersona",
     "KirisameLonnet",
     "根据聊天内容自主切换 LLM 人格的动态人格插件",
-    "1.0.0",
+    "1.0.1",
 )
 class DynamicPersonaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
