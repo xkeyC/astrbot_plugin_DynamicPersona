@@ -30,7 +30,7 @@ _SELECTOR_SYSTEM_PROMPT = """你是一个对话风格分析器。你的任务是
 4. 只返回 JSON 格式的结果，不要有任何其他文字。
 
 返回格式（严格 JSON）：
-{"persona_id": "选中的人格ID"}
+{{"persona_id": "选中的人格ID"}}
 
 如果无法判断或所有场景均不匹配，选择列表中第一个人格作为默认值。
 {extra_prompt}"""
