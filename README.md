@@ -1,83 +1,74 @@
-# 动态人格插件 (astrbot_plugin_DynamicPersona)
+# astrbot_plugin_DynamicPersona
 
-根据用户消息语义，自动切换 AstrBot 的 LLM 人格。
+AstrBot Dynamic Persona Plugin is an advanced extension designed to automatically switch language model personas and providers based on user intent analysis.
 
-## 功能特性
+## Core Capabilities
 
-- 🧠 **语义感知切换**：通过 Selector LLM 分析用户消息，从配置的人格候选列表中选出最合适的一个
-- 🔒 **不干预原生人格**：若当前对话已在 AstrBot 中手动绑定人格，插件自动跳过
-- ⚡ **会话级缓存**：可配置缓存条数，减少不必要的 Selector LLM 调用
-- ⚙️ **WebUI 配置**：所有配置均可在 AstrBot 管理面板中可视化编辑
-- 🛡️ **鲁棒容错**：Selector 调用失败时自动 fallback 到规则列表第一项
+- **Semantic Routing Engine**: Utilizes a Selector LLM to analyze user messages and map their semantic intent to the most appropriate persona from a configured candidate list.
+- **Cross-Provider Dispatch (V2 Architecture)**: Natively intercepts AstrBot's provider instantiation pipeline (`on_waiting_llm_request`). Supports routing requests to entirely different LLM providers and specific models based on the selected persona, allowing seamless switching between local models (e.g., Ollama) and cloud APIs (e.g., OpenAI).
+- **Session-Aware Caching**: Implements a configurable LRU-style cache per user session to minimize redundant Selector LLM invocations and reduce API cost and latency.
+- **Native Context Preservation**: Gracefully skips dynamic routing if the user's current AstrBot conversation has an explicitly bound native persona, preventing conflicts.
+- **Fault-Tolerant Fallback**: Automatically degrades to the root persona rule if the Selector LLM fails to return a valid JSON format or encounters network errors.
 
-## 配置说明
+## Configuration Guide
 
-在 AstrBot WebUI → 插件管理 → 动态人格 → 插件配置 中配置以下项目：
+Navigate to AstrBot WebUI -> Plugin Management -> Dynamic Persona -> Plugin Configuration to adjust the following settings:
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `enabled` | `true` | 是否启用此插件 |
-| `selector_provider_id` | 空（跟随会话） | Selector LLM 使用的模型，建议选轻量快速的模型 |
-| `inject_mode` | `replace` | 人格注入方式：`replace` 完全替换 / `prepend` 前置追加 |
-| `cache_ttl` | `3` | 同一会话中 Selector 结果复用 N 条后才重新选择（0 = 每次都选） |
-| `selector_prompt_extra` | 空 | 附加到 Selector 系统提示的额外偏好描述 |
-| `persona_rules` | `[]` | 人格规则列表，**至少需要配置 2 条** |
+### Global Settings
 
-### 配置 persona_rules
+| Strategy | Description | Default |
+|----------|-------------|---------|
+| `enabled` | Master switch for the dynamic persona routing gateway. | true |
+| `session_filter_mode` | Mode for access control: `disabled` (allow all), `whitelist`, or `blacklist`. | disabled |
+| `session_filter_list` | List of Group IDs or Sender IDs subject to the access control mode. | [] |
+| `selector_provider_id` | Dedicated provider for the Selector LLM. Highly recommended to specify a fast, low-latency model. If left empty, inherits the session's primary provider. | Empty |
+| `inject_mode` | System prompt injection strategy: `replace` (overwrite) or `prepend` (append before existing prompt). | replace |
+| `cache_ttl` | Number of consecutive messages to reuse a selected persona within the same session before re-evaluating. Set to 0 to force evaluation on every message. | 3 |
+| `selector_prompt_extra` | Supplementary instructions appended to the Selector LLM system prompt for fine-tuning routing behavior. | Empty |
 
-每条规则包含两个字段：
+### Persona Rules (`persona_rules`)
 
-- **persona_id**：在 AstrBot 人格管理页面创建的人格 ID，通过下拉框选择
-- **scenario_desc**：该人格适合的使用场景描述（自然语言），越具体越准确
+Define at least two routing scenarios for the plugin to activate.
 
-**示例**：
+| Field | Description |
+|-------|-------------|
+| `rule_enabled` | Toggles the active state of the specific routing rule. |
+| `persona_id` | The target AstrBot persona to apply. Selectable via the native dropdown interface. |
+| `provider_id` | (Cross-Provider Feature) The dedicated LLM provider and model for this persona. Powered by AstrBot's native `select_providers` component. Leave empty to use the session's default model. |
+| `persona_desc` | A concise definition of the persona's role and capabilities to inform the Selector LLM. |
+| `scenario_desc` | A precise natural language description defining the triggering conditions for this persona. |
 
-| 人格 ID | 场景描述 |
-|---------|---------|
-| `fun_friend` | 用户进行轻松打趣、玩梗、调侃、情感陪伴等非正式聊天时 |
-| `expert_assistant` | 用户提出技术问题、正式请求、学术讨论、工作任务分析时 |
+## Architectural Workflow
 
-## 工作流程
+1. **Pre-Flight Hook (`on_waiting_llm_request`)**:
+   - Evaluates master toggles, session filters, and native persona bindings.
+   - Evaluates session cache validity.
+   - Dispatches user message to Selector LLM for intent analysis.
+   - Computes target `persona_id` and `provider_id`.
+   - Mutates `event.set_extra("selected_provider")` and `event.set_extra("selected_model")` to force AstrBot framework to allocate the specified model backend.
 
-```
-用户消息
-    │
-    ▼
-检查原生人格绑定 ──── 已绑定 ──→ 直接放行（不干预）
-    │
-    ▼（未绑定）
-检查 persona_rules 数量 ─── < 2 条 ──→ 直接放行
-    │
-    ▼
-检查会话缓存 ──── 命中 ──→ 复用缓存人格
-    │
-    ▼（未命中）
-Selector LLM（分析消息语义）
-    │
-    ▼
-选中 persona_id → 注入 system_prompt → LLM 请求
-```
+2. **Injection Hook (`on_llm_request`)**:
+   - Retrieves the finalized `system_prompt` from AstrBot's PersonaManager.
+   - Applies the selected `inject_mode` to mutate the outgoing ProviderRequest.
 
-## 管理员指令
+## Administration Commands
 
-所有指令需管理员权限。
+The following commands require AstrBot SuperAdmin privileges.
 
-| 指令 | 说明 |
-|------|------|
-| `/dp status` | 查看插件状态与当前会话缓存信息 |
-| `/dp personas` | 列出 AstrBot 中所有已配置的人格 |
-| `/dp reload` | 清空所有会话缓存，下次消息重新由 Selector 选择 |
-| `/dp enable` | 启用插件 |
-| `/dp disable` | 禁用插件（不影响 AstrBot 原生人格） |
+| Command | Action |
+|---------|--------|
+| `/dp status` | Prints the gateway status, cache depth, and active routing rules for the current session. |
+| `/dp personas` | Fetches and lists all registered persona templates across the AstrBot environment. |
+| `/dp reload` | Purges the memory cache for all sessions, forcing a global re-evaluation on the next request. |
+| `/dp enable` | Activates the core routing gateway. |
+| `/dp disable` | Deactivates the gateway. Does not affect native AstrBot behavior. |
+| `/dp sessionid` | Outputs the current tunnel identification metrics (Group ID, User ID, Session ID) for whitelist configuring. |
 
-## 注意事项
+## System Requirements
 
-- 插件需要 AstrBot **>= v4.5.7**（使用了 `llm_generate`、`persona_manager` 等新 API）
-- Selector LLM 会产生额外的 token 消耗，建议设置一个轻量模型并合理配置 `cache_ttl`
-- 插件的 `on_llm_request` 钩子运行在所有插件的**默认优先级**，如有冲突可联系作者调整
+- Minimum AstrBot Version: **v4.5.7** (Requires `event.set_extra` and modernized `ProviderRequest` lifecycle hooks).
 
-## 版本历史
+## Version History
 
-| 版本 | 说明 |
-|------|------|
-| v1.3.0 | 初始发布：Selector LLM 动态人格选择 + 会话缓存 + 管理员指令 |
+- **v2.0.0 (Current)**: Overhauled routing architecture. Implemented Pre-Flight Provider Interception allowing true engine-wide cross-provider scaling. Supported dual parsing for native `select_providers` component.
+- **v1.3.0**: Initial Release. Basic semantic switching and cache management.
