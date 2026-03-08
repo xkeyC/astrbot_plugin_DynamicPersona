@@ -4,6 +4,19 @@
     "type": "bool",
     "default": true
   },
+  "session_filter_mode": {
+    "description": "会话过滤模式",
+    "type": "string",
+    "default": "disabled",
+    "hint": "disabled：所有会话均生效；whitelist：仅在列表中的会话生效；blacklist：列表中的会话不生效",
+    "options": ["disabled", "whitelist", "blacklist"]
+  },
+  "session_filter_list": {
+    "description": "会话过滤列表（群号 / 用户 ID）",
+    "type": "list",
+    "hint": "填写群号（group_id）或私聊用户 ID。白名单模式下只有列表中的会话启用插件，黑名单模式下列表中的会话禁用插件。发送 /dp sessionid 可查看当前会话 ID",
+    "default": []
+  },
   "selector_provider_id": {
     "description": "Selector LLM 使用的模型提供商（留空则使用会话当前模型）",
     "type": "string",

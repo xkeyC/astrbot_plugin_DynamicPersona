@@ -48,7 +48,7 @@ _SELECTOR_USER_PROMPT_TMPL = """可选人格列表：
     "astrbot_plugin_DynamicPersona",
     "KirisameLonnet",
     "根据聊天内容自主切换 LLM 人格的动态人格插件",
-    "1.0.1",
+    "1.0.2",
 )
 class DynamicPersonaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -84,13 +84,17 @@ class DynamicPersonaPlugin(Star):
         if not self.config.get("enabled", True):
             return
 
-        # 2. 过滤出已启用的 persona_rules，至少需要 2 条
+        # 2. 会话过滤（白名单/黑名单）
+        if not self._check_session_filter(event):
+            return
+
+        # 3. 过滤出已启用的 persona_rules，至少需要 2 条
         all_rules: list[dict] = self.config.get("persona_rules", [])
         rules = [r for r in all_rules if r.get("rule_enabled", True)]
         if len(rules) < 2:
             return
 
-        # 3. 检查当前对话是否已绑定原生人格
+        # 4. 检查当前对话是否已绑定原生人格
         try:
             umo = event.unified_msg_origin
             conv_mgr = self.context.conversation_manager
@@ -107,7 +111,7 @@ class DynamicPersonaPlugin(Star):
             logger.warning(f"[DynamicPersona] 获取对话信息失败，跳过：{e}")
             return
 
-        # 4. 检查缓存
+        # 5. 检查缓存
         user_message = event.message_str.strip()
         cache_ttl: int = self.config.get("cache_ttl", 3)
         selected_persona_id: str | None = None
@@ -122,7 +126,7 @@ class DynamicPersonaPlugin(Star):
                     f" ({cache_entry['hit_count']}/{cache_ttl})"
                 )
 
-        # 5. 缓存未命中，调用 Selector LLM
+        # 6. 缓存未命中，调用 Selector LLM
         if selected_persona_id is None:
             selected_persona_id = await self._run_selector(
                 event, req, rules, user_message
@@ -142,8 +146,49 @@ class DynamicPersonaPlugin(Star):
                     "hit_count": 1,
                 }
 
-        # 6. 注入人格 system_prompt
+        # 7. 注入人格 system_prompt
         await self._inject_persona(req, selected_persona_id)
+
+    # ─────────────────────────────────────────────
+    # 会话过滤
+    # ─────────────────────────────────────────────
+    def _check_session_filter(self, event: AstrMessageEvent) -> bool:
+        """检查当前会话是否通过白名单/黑名单过滤。返回 True 表示允许。"""
+        mode: str = self.config.get("session_filter_mode", "disabled")
+        if mode == "disabled":
+            return True
+
+        filter_list: list[str] = self.config.get("session_filter_list", [])
+        if not filter_list:
+            # 列表为空时：白名单 → 无匹配 → 不生效；黑名单 → 无排除 → 全部生效
+            return mode == "blacklist"
+
+        # 获取当前会话的识别 ID（群号 or 用户 ID）
+        group_id = event.get_group_id() or ""
+        sender_id = event.get_sender_id() or ""
+        session_id = event.message_obj.session_id if event.message_obj else ""
+
+        # 只要任一 ID 出现在 filter_list 中即视为匹配
+        matched = any(
+            fid in (group_id, sender_id, session_id)
+            for fid in filter_list
+            if fid
+        )
+
+        if mode == "whitelist":
+            if not matched:
+                logger.debug(
+                    f"[DynamicPersona] 会话不在白名单中，跳过。"
+                    f" group={group_id} sender={sender_id}"
+                )
+            return matched
+        else:  # blacklist
+            if matched:
+                logger.debug(
+                    f"[DynamicPersona] 会话在黑名单中，跳过。"
+                    f" group={group_id} sender={sender_id}"
+                )
+            return not matched
 
     # ─────────────────────────────────────────────
     # Selector LLM 调用
@@ -318,6 +363,8 @@ class DynamicPersonaPlugin(Star):
         lines = [
             "📋 **动态人格插件状态**",
             f"• 启用: {'✅' if enabled else '❌'}",
+            f"• 会话过滤: {self.config.get('session_filter_mode', 'disabled')}"
+            f" ({len(self.config.get('session_filter_list', []))} 条)",
             f"• 注入方式: {inject_mode}",
             f"• 缓存条数 (TTL): {cache_ttl}",
             f"• Selector 模型: {selector_pid}",
@@ -375,6 +422,24 @@ class DynamicPersonaPlugin(Star):
         self.config["enabled"] = False
         self.config.save_config()
         yield event.plain_result("⏸️ 动态人格插件已禁用。")
+
+    @dp.command("sessionid")
+    async def dp_sessionid(self, event: AstrMessageEvent):
+        """显示当前会话的 ID 信息（用于配置白名单/黑名单）"""
+        group_id = event.get_group_id() or "（私聊）"
+        sender_id = event.get_sender_id() or "（未知）"
+        session_id = event.message_obj.session_id if event.message_obj else "（未知）"
+        umo = event.unified_msg_origin
+        lines = [
+            "🔑 **当前会话 ID 信息**",
+            f"• 群号 (group_id): {group_id}",
+            f"• 发送者 (sender_id): {sender_id}",
+            f"• 会话 (session_id): {session_id}",
+            f"• UMO: {umo}",
+            "",
+            "将群号或用户 ID 填入插件配置的「会话过滤列表」中即可。",
+        ]
+        yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
         """插件卸载时清理缓存"""
