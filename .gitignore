@@ -7,3 +7,4 @@ dist/
 build/
 .ruff_cache/
 开发指南.md
+AstrBot_src/

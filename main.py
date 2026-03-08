@@ -2,15 +2,25 @@
 动态人格插件 (astrbot_plugin_DynamicPersona)
 ==========================================
 根据用户消息语义，使用 Selector LLM 动态选择最合适的人格（system_prompt）
-注入到 LLM 请求中，实现对话风格的自动切换。
+注入到 LLM 请求中，实现对话风格的自动切换。支持跨不同的平台接口/模型进行无缝调度。
 
 主要逻辑：
-1. 拦截 on_llm_request 事件。
-2. 若当前对话已绑定原生人格（conversation.persona_id 非 None），直接放行。
-3. 从 persona_rules 中过滤出 rule_enabled=True 的规则，不足 2 条则放行。
-4. 检查 session 维度缓存，命中则复用上次选择结果，否则调用 Selector LLM。
-5. Selector LLM 基于每条规则的「人格描述」和「使用场景」分析用户消息，返回最合适的 persona_id。
-6. 从 PersonaManager 获取该 persona 的 system_prompt 并注入到请求中。
+【阶段零】：预检测
+  - `on_astrbot_loaded`: 初次加载时记录启用的规则数量，处理启动逻辑。
+
+【阶段一】：Provider 底层拦截 (`on_waiting_llm_request`)
+  1. 会话过滤白/黑名单
+  2. 过滤已启用的 persona_rules，不足2条则放行
+  3. 获取当前原生对话是否已绑定原生人格，若有则跳过
+  4. 检查 session 维度缓存，若超期或没命中，则调用 Selector LLM 返回 persona_id
+  5. 获取该 persona_id 对应的 provider_id
+  6. 通过 `event.set_extra("selected_provider", target_provider_id)` 直接替换 AstrBot 内部即将实例化的模型接口！
+  7. 缓存 provider_id 和 persona_id 供下一个阶段注入使用（`event.set_extra("dynamic_persona_id", persona_id)`）。
+
+【阶段二】：Persona 注入 (`on_llm_request`)
+  1. 通过 `event.get_extra("dynamic_persona_id")` 判断当前有没有走动态人格拦截（或是命中缓存），没有则直接退出
+  2. 利用 PersonaManager 获取选中人格的内容
+  3. 根据 inject_mode，替换或增强传入的大模型请求 `req.system_prompt`。
 """
 
 import json
@@ -19,6 +29,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
+
 
 # Selector 系统提示词模板
 _SELECTOR_SYSTEM_PROMPT = """你是一个对话风格分析器。你的任务是根据用户最新发送的消息，从给定的人格列表中选择最合适的一个。
@@ -35,6 +46,7 @@ _SELECTOR_SYSTEM_PROMPT = """你是一个对话风格分析器。你的任务是
 如果无法判断或所有场景均不匹配，选择列表中第一个人格作为默认值。
 {extra_prompt}"""
 
+
 _SELECTOR_USER_PROMPT_TMPL = """可选人格列表：
 {persona_list}
 
@@ -47,8 +59,8 @@ _SELECTOR_USER_PROMPT_TMPL = """可选人格列表：
 @register(
     "astrbot_plugin_DynamicPersona",
     "KirisameLonnet",
-    "根据聊天内容自主切换 LLM 人格的动态人格插件",
-    "1.0.2",
+    "能够跨平台/跨模型无缝调度并且自主切换系统设定的动态人格插件",
+    "2.0.0",
 )
 class DynamicPersonaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -57,44 +69,38 @@ class DynamicPersonaPlugin(Star):
 
         # 会话维度的人格选择缓存
         # key: unified_msg_origin (str)
-        # value: {"persona_id": str, "hit_count": int}
+        # value: {"persona_id": str, "provider_id": str, "hit_count": int}
         self._persona_cache: dict[str, dict] = {}
 
     async def initialize(self):
         all_rules = self.config.get("persona_rules", [])
-        active_count = sum(
-            1 for r in all_rules if r.get("rule_enabled", True)
-        )
+        active_count = sum(1 for r in all_rules if r.get("rule_enabled", True))
         logger.info(
-            "[DynamicPersona] 插件已加载。"
-            f" enabled={self.config.get('enabled', True)}"
-            f" cache_ttl={self.config.get('cache_ttl', 3)}"
-            f" inject_mode={self.config.get('inject_mode', 'replace')}"
-            f" rules={active_count}/{len(all_rules)}(启用/总计)"
+            f"[DynamicPersona] v2.0 插件已加载。 "
+            f"enabled={self.config.get('enabled', True)} "
+            f"cache_ttl={self.config.get('cache_ttl', 3)} "
+            f"rules={active_count}/{len(all_rules)}"
         )
 
     # ─────────────────────────────────────────────
-    # 核心钩子：LLM 请求前
+    # 钩子一：生成请求前拦截（决定使用哪个 API Provider）
     # ─────────────────────────────────────────────
-    @filter.on_llm_request()
-    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """在 LLM 调用前动态选择并注入人格。"""
+    @filter.on_waiting_llm_request()
+    async def on_waiting_llm(self, event: AstrMessageEvent):
+        """在请求真正到达任何 Provider 前执行核心策略：分配 Provider。"""
 
-        # 1. 插件全局开关
+        # 1. 全局开关与会话过滤
         if not self.config.get("enabled", True):
             return
-
-        # 2. 会话过滤（白名单/黑名单）
         if not self._check_session_filter(event):
             return
 
-        # 3. 过滤出已启用的 persona_rules，至少需要 2 条
         all_rules: list[dict] = self.config.get("persona_rules", [])
         rules = [r for r in all_rules if r.get("rule_enabled", True)]
         if len(rules) < 2:
             return
 
-        # 4. 检查当前对话是否已绑定原生人格
+        # 2. 检查是否有原生人格绑定
         try:
             umo = event.unified_msg_origin
             conv_mgr = self.context.conversation_manager
@@ -103,72 +109,121 @@ class DynamicPersonaPlugin(Star):
                 conversation = await conv_mgr.get_conversation(umo, curr_cid)
                 if conversation and conversation.persona_id is not None:
                     logger.debug(
-                        f"[DynamicPersona] 会话 {umo} 已绑定原生人格"
-                        f" {conversation.persona_id}，跳过动态选择。"
+                        f"[DynamicPersona] 会话 {umo} 已绑定原生人格，跳过动态调度。"
                     )
                     return
         except Exception as e:
-            logger.warning(f"[DynamicPersona] 获取对话信息失败，跳过：{e}")
+            logger.warning(f"[DynamicPersona] 获取原生对话信息失败，跳过：{e}")
             return
 
-        # 5. 检查缓存
+        # 3. 读取本地会话缓存或请求大模型调度
         user_message = event.message_str.strip()
         cache_ttl: int = self.config.get("cache_ttl", 3)
         selected_persona_id: str | None = None
+        selected_provider_id: str = ""
 
         if cache_ttl > 0 and umo in self._persona_cache:
             cache_entry = self._persona_cache[umo]
             if cache_entry["hit_count"] < cache_ttl:
                 selected_persona_id = cache_entry["persona_id"]
+                selected_provider_id = cache_entry.get("provider_id", "")
                 cache_entry["hit_count"] += 1
                 logger.debug(
-                    f"[DynamicPersona] 命中缓存人格 {selected_persona_id}"
-                    f" ({cache_entry['hit_count']}/{cache_ttl})"
+                    f"[DynamicPersona] 命中缓存人格 {selected_persona_id} "
+                    f"provider={selected_provider_id or '(当前会话默认)'} "
+                    f"({cache_entry['hit_count']}/{cache_ttl})"
                 )
 
-        # 6. 缓存未命中，调用 Selector LLM
         if selected_persona_id is None:
+            # 缓存不存在或超期，发起选取请求
             selected_persona_id = await self._run_selector(
-                event, req, rules, user_message
+                event, rules, user_message
             )
             if selected_persona_id is None:
-                # Selector 调用失败，回退到第一个规则
                 selected_persona_id = rules[0].get("persona_id", "")
                 logger.warning(
-                    f"[DynamicPersona] Selector 失败，回退使用规则 #0："
-                    f" {selected_persona_id}"
+                    f"[DynamicPersona] Selector 选取失败，自动回退规则 #0: {selected_persona_id}"
                 )
 
-            # 更新缓存
+            # 查询命中的 provider_id
+            for rule in rules:
+                if rule.get("persona_id") == selected_persona_id:
+                    selected_provider_id = rule.get("provider_id", "") or ""
+                    break
+
+            # 存储此轮对话缓存
             if cache_ttl > 0:
                 self._persona_cache[umo] = {
                     "persona_id": selected_persona_id,
+                    "provider_id": selected_provider_id,
                     "hit_count": 1,
                 }
 
-        # 7. 注入人格 system_prompt
-        await self._inject_persona(req, selected_persona_id)
+        # 4. 【核心跨模型调度逻辑】强制注入 Provider 控制权
+        if selected_provider_id:
+            # AstrBot 原生兼容该特权调度，会使得下一环节的 on_llm_request 分配到正确的 Provider！
+            logger.debug(
+                f"[DynamicPersona] 强制设定底层派发 provider={selected_provider_id}"
+            )
+            event.set_extra("selected_provider", selected_provider_id)
+
+        # 把即将需要替换的 persona 放进 event。
+        # 这样在 on_llm_request 时就能知道这个请求是经过我们处理并要求覆写内容的了
+        event.set_extra("dynamic_persona_id", selected_persona_id)
+
+
+    # ─────────────────────────────────────────────
+    # 钩子二：Provider Ready 之后的拦截（注入 Prompt 设置）
+    # ─────────────────────────────────────────────
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        """当 ProviderRequest 完全构成准备发送到模型时，我们只需要负责把 Prompt 写进去"""
+        persona_id = event.get_extra("dynamic_persona_id")
+        
+        # 如果钩子一并没有写入该值（例如 disabled、有原生人格等），无需做任何事
+        if not persona_id:
+            return
+
+        try:
+            persona_mgr = self.context.persona_manager
+            persona = await persona_mgr.get_persona(persona_id)
+            if persona is None:
+                logger.warning(
+                    f"[DynamicPersona] 需要注入的人格 ID '{persona_id}' 不存在，请检查 WebUI。"
+                )
+                return
+
+            new_sp = persona.system_prompt or ""
+            inject_mode: str = self.config.get("inject_mode", "replace")
+
+            if inject_mode == "prepend" and req.system_prompt:
+                req.system_prompt = new_sp + "\n\n" + req.system_prompt
+            else:
+                req.system_prompt = new_sp
+
+            logger.debug(
+                f"[DynamicPersona] 已成功注入人格特征 '{persona_id}'"
+            )
+        except Exception as e:
+            logger.error(f"[DynamicPersona] 最终注入指令时发生错误: {e}")
+
 
     # ─────────────────────────────────────────────
     # 会话过滤
     # ─────────────────────────────────────────────
     def _check_session_filter(self, event: AstrMessageEvent) -> bool:
-        """检查当前会话是否通过白名单/黑名单过滤。返回 True 表示允许。"""
         mode: str = self.config.get("session_filter_mode", "disabled")
         if mode == "disabled":
             return True
 
         filter_list: list[str] = self.config.get("session_filter_list", [])
         if not filter_list:
-            # 列表为空时：白名单 → 无匹配 → 不生效；黑名单 → 无排除 → 全部生效
             return mode == "blacklist"
 
-        # 获取当前会话的识别 ID（群号 or 用户 ID）
         group_id = event.get_group_id() or ""
         sender_id = event.get_sender_id() or ""
         session_id = event.message_obj.session_id if event.message_obj else ""
-
-        # 只要任一 ID 出现在 filter_list 中即视为匹配
+        
         matched = any(
             fid in (group_id, sender_id, session_id)
             for fid in filter_list
@@ -176,32 +231,20 @@ class DynamicPersonaPlugin(Star):
         )
 
         if mode == "whitelist":
-            if not matched:
-                logger.debug(
-                    f"[DynamicPersona] 会话不在白名单中，跳过。"
-                    f" group={group_id} sender={sender_id}"
-                )
             return matched
-        else:  # blacklist
-            if matched:
-                logger.debug(
-                    f"[DynamicPersona] 会话在黑名单中，跳过。"
-                    f" group={group_id} sender={sender_id}"
-                )
+        else:
             return not matched
 
+
     # ─────────────────────────────────────────────
-    # Selector LLM 调用
+    # Selector 调用逻辑封装
     # ─────────────────────────────────────────────
     async def _run_selector(
         self,
         event: AstrMessageEvent,
-        req: ProviderRequest,
         rules: list[dict],
         user_message: str,
     ) -> str | None:
-        """调用 Selector LLM 分析消息并返回最合适的 persona_id。"""
-        # 构建人格列表描述（包含人格描述 + 使用场景）
         persona_list_lines = []
         for i, rule in enumerate(rules):
             pid = rule.get("persona_id", "")
@@ -223,50 +266,40 @@ class DynamicPersonaPlugin(Star):
             user_message=user_message or "（空消息）",
         )
 
-        # 决定使用哪个 provider 调用 Selector
         selector_provider_id: str = self.config.get("selector_provider_id", "").strip()
         if not selector_provider_id:
-            # 使用当前会话绑定的模型
             try:
                 selector_provider_id = await self.context.get_current_chat_provider_id(
                     umo=event.unified_msg_origin
                 )
             except Exception as e:
-                logger.warning(f"[DynamicPersona] 获取当前 provider 失败：{e}")
+                logger.warning(f"[DynamicPersona] 获取默认派发通道失败: {e}")
                 return None
 
         if not selector_provider_id:
-            logger.warning("[DynamicPersona] 无可用的 provider，跳过 Selector。")
+            logger.warning("[DynamicPersona] 无法启动 Selector，目前没有可用的 provider！")
             return None
 
         try:
-            logger.debug(
-                f"[DynamicPersona] 使用 provider={selector_provider_id} 调用 Selector..."
-            )
+            logger.debug(f"[DynamicPersona] Dispatch Selector LLM via provider={selector_provider_id}")
             llm_resp = await self.context.llm_generate(
                 chat_provider_id=selector_provider_id,
                 prompt=user_prompt,
                 system_prompt=system_prompt,
             )
             raw_text = (llm_resp.completion_text or "").strip()
-            logger.debug(f"[DynamicPersona] Selector 原始返回：{raw_text!r}")
-
-            # 解析 JSON，容错处理
             return self._parse_selector_response(raw_text, rules)
-
         except Exception as e:
-            logger.error(f"[DynamicPersona] Selector LLM 调用失败：{e}")
+            logger.error(f"[DynamicPersona] Selector LLM 调用过程中断: {e}")
             return None
+
 
     def _parse_selector_response(
         self, raw_text: str, rules: list[dict]
     ) -> str | None:
-        """从 Selector LLM 的返回文本中解析出 persona_id，做容错处理。"""
         valid_ids = {r.get("persona_id", "") for r in rules}
 
-        # 优先直接解析 JSON
         try:
-            # 有时 LLM 会返回带 markdown 代码块的 JSON
             text = raw_text
             if "```" in text:
                 start = text.find("{")
@@ -276,99 +309,62 @@ class DynamicPersonaPlugin(Star):
             data = json.loads(text)
             pid = data.get("persona_id", "")
             if pid in valid_ids and pid:
-                logger.info(f"[DynamicPersona] Selector 选定人格：{pid}")
+                logger.info(f"[DynamicPersona] 经过决策树分支选取角色为: {pid}")
                 return pid
         except (json.JSONDecodeError, AttributeError):
             pass
 
-        # 容错：遍历查找是否有 valid_id 出现在返回文本中
         for pid in valid_ids:
             if pid and pid in raw_text:
-                logger.info(f"[DynamicPersona] Selector 容错匹配人格：{pid}")
+                logger.info(f"[DynamicPersona] 降级至容错匹配角色为: {pid}")
                 return pid
 
-        logger.warning(
-            f"[DynamicPersona] 无法从 Selector 返回中解析有效 persona_id："
-            f" {raw_text!r}"
-        )
+        logger.warning(f"[DynamicPersona] 解析异常或返回无效: {raw_text!r}")
         return None
 
     # ─────────────────────────────────────────────
-    # 人格注入
-    # ─────────────────────────────────────────────
-    async def _inject_persona(self, req: ProviderRequest, persona_id: str):
-        """将指定人格的 system_prompt 注入到 LLM 请求中。"""
-        if not persona_id:
-            return
-
-        try:
-            persona_mgr = self.context.persona_manager
-            persona = await persona_mgr.get_persona(persona_id)
-            if persona is None:
-                logger.warning(
-                    f"[DynamicPersona] 人格 {persona_id!r} 不存在，跳过注入。"
-                )
-                return
-
-            new_sp = persona.system_prompt or ""
-            inject_mode: str = self.config.get("inject_mode", "replace")
-
-            if inject_mode == "prepend" and req.system_prompt:
-                req.system_prompt = new_sp + "\n\n" + req.system_prompt
-            else:
-                req.system_prompt = new_sp
-
-            logger.debug(
-                f"[DynamicPersona] 已注入人格 {persona_id!r}"
-                f" (mode={inject_mode})"
-                f" system_prompt 长度={len(new_sp)}"
-            )
-        except Exception as e:
-            logger.error(f"[DynamicPersona] 注入人格失败：{e}")
-
-    # ─────────────────────────────────────────────
-    # 管理员指令
+    # 管理员指令组
     # ─────────────────────────────────────────────
     @filter.command_group("dp")
     def dp(self):
-        """动态人格插件管理指令组"""
+        """动态人格调度管理"""
 
     @dp.command("status")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def dp_status(self, event: AstrMessageEvent):
-        """查看动态人格插件当前状态"""
+        """查看跨引擎调度层当前状态"""
         enabled = self.config.get("enabled", True)
         all_rules: list = self.config.get("persona_rules", [])
         active_rules = [r for r in all_rules if r.get("rule_enabled", True)]
         cache_ttl = self.config.get("cache_ttl", 3)
         inject_mode = self.config.get("inject_mode", "replace")
-        selector_pid = self.config.get("selector_provider_id", "") or "（跟随会话）"
+        selector_pid = self.config.get("selector_provider_id", "") or "（联动会话通道）"
 
         umo = event.unified_msg_origin
         cache_info = self._persona_cache.get(umo)
         cache_str = (
-            f"当前人格缓存: {cache_info['persona_id']}"
-            f" [{cache_info['hit_count']}/{cache_ttl}]"
-            if cache_info
-            else "当前无缓存"
+            f"当前缓存: {cache_info['persona_id']}"
+            f" → Provider[{cache_info.get('provider_id') or '不指定(原生)'}] "
+            f"({cache_info['hit_count']}/{cache_ttl})"
+            if cache_info else "目前处于未驻留状态"
         )
 
-        # 列出每条规则的启用状态
         rules_detail = []
         for r in all_rules:
-            flag = "✅" if r.get("rule_enabled", True) else "⬜"
+            flag = "☑" if r.get("rule_enabled", True) else "☐"
             pid = r.get("persona_id", "???")
-            rules_detail.append(f"  {flag} {pid}")
+            prov = r.get("provider_id", "") or "跟随"
+            rules_detail.append(f"  {flag} {pid} [{prov}]")
 
         lines = [
-            "📋 **动态人格插件状态**",
-            f"• 启用: {'✅' if enabled else '❌'}",
-            f"• 会话过滤: {self.config.get('session_filter_mode', 'disabled')}"
-            f" ({len(self.config.get('session_filter_list', []))} 条)",
-            f"• 注入方式: {inject_mode}",
-            f"• 缓存条数 (TTL): {cache_ttl}",
-            f"• Selector 模型: {selector_pid}",
-            f"• 人格规则: {len(active_rules)}/{len(all_rules)}(启用/总计)",
+            "🧠 **DynamicPersona V2 调度器核心**",
+            f"• 状态: {'✅' if enabled else '❌'}",
+            f"• 访问控制: {self.config.get('session_filter_mode', 'disabled')}"
+            f" (活跃 {len(self.config.get('session_filter_list', []))} 个通道限制)",
+            f"• 注入逻辑层: {inject_mode}",
+            f"• LRU 深度: {cache_ttl}",
+            f"• 取样神经元: {selector_pid}",
+            f"• 挂载规则: {len(active_rules)}/{len(all_rules)} 项可用",
             *rules_detail,
             f"• {cache_str}",
         ]
@@ -377,18 +373,18 @@ class DynamicPersonaPlugin(Star):
     @dp.command("personas")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def dp_personas(self, event: AstrMessageEvent):
-        """列出当前 AstrBot 中所有可用的人格"""
+        """侦听网络内所有可用的人格模版"""
         try:
             all_personas = await self.context.persona_manager.get_all_personas()
         except Exception as e:
-            yield event.plain_result(f"❌ 获取人格列表失败：{e}")
+            yield event.plain_result(f"❌ 读取错误由于 API 请求拦截: {e}")
             return
 
         if not all_personas:
-            yield event.plain_result("📭 当前没有已配置的人格。")
+            yield event.plain_result("📭 系统原生档案检索：发现零条可用项。")
             return
 
-        lines = ["🎭 **可用人格列表**"]
+        lines = ["🎭 **全局可用人格模板一览**"]
         for p in all_personas:
             sp_preview = (p.system_prompt or "")[:50].replace("\n", " ")
             if len(p.system_prompt or "") > 50:
@@ -400,48 +396,46 @@ class DynamicPersonaPlugin(Star):
     @dp.command("reload")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def dp_reload(self, event: AstrMessageEvent):
-        """清空所有会话的人格缓存，下次消息将重新由 Selector 选择"""
+        """清除缓存树让 Selector 重新介入"""
         count = len(self._persona_cache)
         self._persona_cache.clear()
-        yield event.plain_result(
-            f"✅ 已清空 {count} 个会话的人格缓存。下次对话将重新由 Selector 选择人格。"
-        )
+        yield event.plain_result(f"✅ 成功剥离了 {count} 个热会话的人格上下文记忆体。")
 
     @dp.command("enable")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def dp_enable(self, event: AstrMessageEvent):
-        """启用动态人格插件"""
+        """激活全网 Selector 控制层"""
         self.config["enabled"] = True
         self.config.save_config()
-        yield event.plain_result("✅ 动态人格插件已启用。")
+        yield event.plain_result("🚀 动态人格网关注入完成，跨引擎调度已激活。")
 
     @dp.command("disable")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def dp_disable(self, event: AstrMessageEvent):
-        """禁用动态人格插件（不影响 AstrBot 原生人格）"""
+        """断开网关路由进入免打扰"""
         self.config["enabled"] = False
         self.config.save_config()
-        yield event.plain_result("⏸️ 动态人格插件已禁用。")
+        yield event.plain_result("⏸️ 分支网关处于断开状态。")
 
     @dp.command("sessionid")
     async def dp_sessionid(self, event: AstrMessageEvent):
-        """显示当前会话的 ID 信息（用于配置白名单/黑名单）"""
-        group_id = event.get_group_id() or "（私聊）"
-        sender_id = event.get_sender_id() or "（未知）"
-        session_id = event.message_obj.session_id if event.message_obj else "（未知）"
+        """探知当前链路凭据参数"""
+        group_id = event.get_group_id() or "私聊隧道"
+        sender_id = event.get_sender_id() or "未知终点"
+        session_id = event.message_obj.session_id if event.message_obj else "无主"
         umo = event.unified_msg_origin
         lines = [
-            "🔑 **当前会话 ID 信息**",
-            f"• 群号 (group_id): {group_id}",
-            f"• 发送者 (sender_id): {sender_id}",
-            f"• 会话 (session_id): {session_id}",
-            f"• UMO: {umo}",
+            "🔑 **当前通道指纹识别码**",
+            f"• Node (群组): {group_id}",
+            f"• User (标识): {sender_id}",
+            f"• Tunnels (会话窗): {session_id}",
+            f"• 聚合锚定 UMO: {umo}",
             "",
-            "将群号或用户 ID 填入插件配置的「会话过滤列表」中即可。",
+            "请截取你需要拦截或放通的 ID 加入控制列表。",
         ]
         yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
-        """插件卸载时清理缓存"""
+        """销毁释放"""
         self._persona_cache.clear()
-        logger.info("[DynamicPersona] 插件已卸载，缓存已清理。")
+        logger.info("[DynamicPersona] Session 神经束已被切断。")
