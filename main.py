@@ -24,6 +24,7 @@ from astrbot.api.star import Context, Star, register
 
 _SELECTOR_TIMEOUT_SECONDS = 8
 _EVENT_DECISION_KEY = "dynamic_persona_decision"
+_MAX_CACHE_SIZE = 1024
 
 _SELECTOR_SYSTEM_PROMPT = """你是一个对话风格分析器。你的任务是根据用户最新发送的消息，从给定的人格列表中选择最合适的一个。
 
@@ -182,9 +183,9 @@ class DynamicPersonaPlugin(Star):
             rules.append(
                 PersonaRule(
                     persona_id=persona_id,
-                    persona_desc=str(item.get("persona_desc", "") or "").strip(),
-                    scenario_desc=str(item.get("scenario_desc", "") or "").strip(),
-                    provider_id=str(item.get("provider_id", "") or "").strip(),
+                    persona_desc=str(item.get("persona_desc", "")).strip(),
+                    scenario_desc=str(item.get("scenario_desc", "")).strip(),
+                    provider_id=str(item.get("provider_id", "")).strip(),
                     enabled=True,
                 )
             )
@@ -201,7 +202,7 @@ class DynamicPersonaPlugin(Star):
                 )
                 or {}
             )
-            persona_id = str(session_service_config.get("persona_id", "") or "").strip()
+            persona_id = str(session_service_config.get("persona_id", "")).strip()
             if persona_id and persona_id != "[%None]":
                 logger.debug(
                     "[DynamicPersona] session %s already forced to persona %s, skip dynamic flow",
@@ -236,6 +237,9 @@ class DynamicPersonaPlugin(Star):
                 source="cache",
             )
 
+        if cached is not None:
+            self._persona_cache.pop(umo, None)
+
         selected_persona_id = await self._run_selector(event, rules)
         decision_source = "selector"
         if not selected_persona_id:
@@ -255,6 +259,7 @@ class DynamicPersonaPlugin(Star):
 
         if cache_ttl > 0:
             self._persona_cache[umo] = CachedDecision(decision=decision, hit_count=1)
+            self._prune_cache()
 
         return decision
 
@@ -322,14 +327,14 @@ class DynamicPersonaPlugin(Star):
         raw = event.get_extra(_EVENT_DECISION_KEY)
         if not isinstance(raw, dict):
             return None
-        persona_id = str(raw.get("persona_id", "") or "").strip()
+        persona_id = str(raw.get("persona_id", "")).strip()
         if not persona_id:
             return None
         return PersonaDecision(
             persona_id=persona_id,
-            provider_id=str(raw.get("provider_id", "") or "").strip(),
-            model_name=str(raw.get("model_name", "") or "").strip(),
-            source=str(raw.get("source", "selector") or "selector"),
+            provider_id=str(raw.get("provider_id", "")).strip(),
+            model_name=str(raw.get("model_name", "")).strip(),
+            source=str(raw.get("source", "selector")).strip() or "selector",
         )
 
     def _find_rule_by_persona_id(
@@ -409,29 +414,40 @@ class DynamicPersonaPlugin(Star):
         raw_text: str,
         rules: list[PersonaRule],
     ) -> str | None:
-        valid_ids = [rule.persona_id for rule in rules if rule.persona_id]
-        valid_id_set = set(valid_ids)
+        valid_id_set = {rule.persona_id for rule in rules if rule.persona_id}
+        candidate_texts = [raw_text]
 
-        try:
-            text = raw_text
-            if "```" in text:
-                start = text.find("{")
-                end = text.rfind("}") + 1
-                if start != -1 and end > start:
-                    text = text[start:end]
-            data = json.loads(text)
-            persona_id = str(data.get("persona_id", "") or "").strip()
+        json_fragment = self._extract_json_object(raw_text)
+        if json_fragment and json_fragment != raw_text:
+            candidate_texts.append(json_fragment)
+
+        for text in candidate_texts:
+            try:
+                data = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            persona_id = str(data.get("persona_id", "")).strip()
             if persona_id in valid_id_set:
-                return persona_id
-        except (json.JSONDecodeError, TypeError, AttributeError):
-            pass
-
-        for persona_id in valid_ids:
-            if persona_id and persona_id in raw_text:
                 return persona_id
 
         logger.warning("[DynamicPersona] invalid selector response: %r", raw_text)
         return None
+
+    def _extract_json_object(self, text: str) -> str | None:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        return text[start : end + 1]
+
+    def _prune_cache(self) -> None:
+        overflow = len(self._persona_cache) - _MAX_CACHE_SIZE
+        if overflow <= 0:
+            return
+        for key in list(self._persona_cache)[:overflow]:
+            self._persona_cache.pop(key, None)
 
     def _check_session_filter(self, event: AstrMessageEvent) -> bool:
         mode = str(self.config.get("session_filter_mode", "disabled") or "disabled")
@@ -455,10 +471,10 @@ class DynamicPersonaPlugin(Star):
             return matched
         return not matched
 
+    @filter.command_group("dp")
     def dp(self):
         """动态人格调度管理"""
-
-    dp = filter.command_group("dp")(dp)
+        return None
 
     @dp.command("status")  # type: ignore[attr-defined]
     @filter.permission_type(filter.PermissionType.ADMIN)
