@@ -16,7 +16,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from astrbot.api import AstrBotConfig, logger
+from astrbot.api import AstrBotConfig, logger, sp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
@@ -109,7 +109,7 @@ class DynamicPersonaPlugin(Star):
         if len(rules) < 2:
             return
 
-        if await self._has_native_persona_binding(event):
+        if await self._has_forced_persona_binding(event):
             return
 
         decision = await self._get_or_select_decision(event, rules)
@@ -125,6 +125,9 @@ class DynamicPersonaPlugin(Star):
             return
 
         try:
+            if req.conversation is not None:
+                req.conversation.persona_id = decision.persona_id
+
             persona = await self.context.persona_manager.get_persona(
                 decision.persona_id
             )
@@ -187,26 +190,30 @@ class DynamicPersonaPlugin(Star):
             )
         return rules
 
-    async def _has_native_persona_binding(self, event: AstrMessageEvent) -> bool:
+    async def _has_forced_persona_binding(self, event: AstrMessageEvent) -> bool:
         try:
-            umo = event.unified_msg_origin
-            conv_mgr = self.context.conversation_manager
-            curr_cid = await conv_mgr.get_curr_conversation_id(umo)
-            if not curr_cid:
-                return False
-            conversation = await conv_mgr.get_conversation(umo, curr_cid)
-            if conversation and conversation.persona_id is not None:
+            session_service_config = (
+                await sp.get_async(
+                    scope="umo",
+                    scope_id=str(event.unified_msg_origin),
+                    key="session_service_config",
+                    default={},
+                )
+                or {}
+            )
+            persona_id = str(session_service_config.get("persona_id", "") or "").strip()
+            if persona_id and persona_id != "[%None]":
                 logger.debug(
-                    "[DynamicPersona] session %s already bound to native persona %s",
-                    umo,
-                    conversation.persona_id,
+                    "[DynamicPersona] session %s already forced to persona %s, skip dynamic flow",
+                    event.unified_msg_origin,
+                    persona_id,
                 )
                 return True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning(
-                "[DynamicPersona] failed to inspect native conversation persona, continue dynamic flow: %s",
+                "[DynamicPersona] failed to inspect forced session persona, continue dynamic flow: %s",
                 exc,
             )
         return False
@@ -230,8 +237,10 @@ class DynamicPersonaPlugin(Star):
             )
 
         selected_persona_id = await self._run_selector(event, rules)
+        decision_source = "selector"
         if not selected_persona_id:
             selected_persona_id = rules[0].persona_id if rules else ""
+            decision_source = "fallback-default"
 
         if not selected_persona_id:
             return None
@@ -242,7 +251,7 @@ class DynamicPersonaPlugin(Star):
         if rule is None:
             return None
 
-        decision = await self._build_decision_from_rule(event, rule)
+        decision = await self._build_decision_from_rule(event, rule, decision_source)
 
         if cache_ttl > 0:
             self._persona_cache[umo] = CachedDecision(decision=decision, hit_count=1)
@@ -253,6 +262,7 @@ class DynamicPersonaPlugin(Star):
         self,
         event: AstrMessageEvent,
         rule: PersonaRule,
+        source: str,
     ) -> PersonaDecision:
         provider_id = ""
         model_name = ""
@@ -279,7 +289,7 @@ class DynamicPersonaPlugin(Star):
             persona_id=rule.persona_id,
             provider_id=provider_id,
             model_name=model_name,
-            source="selector",
+            source=source,
         )
 
     async def _get_current_chat_provider_id(self, event: AstrMessageEvent) -> str:
