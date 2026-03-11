@@ -4,82 +4,43 @@
     "type": "bool",
     "default": true
   },
-  "session_filter_mode": {
-    "description": "会话过滤模式",
-    "type": "string",
-    "default": "disabled",
-    "hint": "disabled：所有会话均生效；whitelist：仅在列表中的会话生效；blacklist：列表中的会话不生效",
-    "options": ["disabled", "whitelist", "blacklist"]
-  },
-  "session_filter_list": {
-    "description": "会话过滤列表（群号 / 用户 ID）",
-    "type": "list",
-    "hint": "填写群号（group_id）或私聊用户 ID。白名单模式下只有列表中的会话启用插件，黑名单模式下列表中的会话禁用插件。发送 /dp sessionid 可查看当前会话 ID",
-    "default": []
-  },
-  "selector_provider_id": {
-    "description": "Selector LLM 使用的模型提供商（留空则使用会话当前模型）",
-    "type": "string",
-    "_special": "select_provider",
-    "hint": "建议选择一个轻量、快速的模型（如 qwen-turbo）以降低延迟，留空则与主对话使用同一模型",
-    "default": ""
-  },
-  "inject_mode": {
-    "description": "人格注入方式",
-    "type": "string",
-    "default": "replace",
-    "hint": "replace：完全替换 system_prompt（推荐）；prepend：将选中人格追加到原有 system_prompt 之前",
-    "options": ["replace", "prepend"]
-  },
-  "cache_ttl": {
-    "description": "Selector 结果缓存消息条数（同一会话中复用 N 条后才重新选择人格）",
-    "type": "int",
-    "default": 3,
-    "hint": "设为 0 则每次消息都重新调用 Selector LLM（精准但有额外延迟）"
-  },
-  "selector_prompt_extra": {
-    "description": "Selector 附加提示词（追加到 Selector 系统提示末尾，可用于微调选择偏好）",
-    "type": "text",
-    "default": "",
-    "hint": "例如：当用户使用中文时，优先选择更活泼的人格"
-  },
-  "persona_rules": {
-    "description": "动态人格规则列表（至少启用 2 个人格插件才会生效）",
+  "persona_bindings": {
+    "description": "人格绑定规则",
     "type": "template_list",
-    "hint": "从 AstrBot 人格列表中选择人格，为每个人格填写描述和适用场景，并决定是否启用",
+    "hint": "配置匹配条件与人格的绑定关系。匹配成功后将完全替换人格设置（包括 tools、skills、begin_dialogs、custom_error_message 等）",
     "templates": {
-      "persona_rule": {
-        "name": "人格规则",
-        "hint": "配置一条人格规则：选择人格、填写描述、设定使用场景",
+      "binding_rule": {
+        "name": "绑定规则",
+        "hint": "配置匹配条件和对应人格",
         "items": {
           "rule_enabled": {
-            "description": "是否启用该人格规则",
+            "description": "是否启用该规则",
             "type": "bool",
             "default": true
           },
+          "rule_name": {
+            "description": "规则名称",
+            "type": "string",
+            "default": "",
+            "hint": "可选，用于在日志中识别该规则"
+          },
+          "match_conditions": {
+            "description": "匹配条件（每行一个）",
+            "type": "text",
+            "default": "",
+            "hint": "格式：群ID/发送者ID（精确匹配）、p_发送者ID（匹配发送者）、g_群ID（匹配群）。每行一个条件，任一匹配即生效"
+          },
           "persona_id": {
-            "description": "选择人格",
+            "description": "关联的人格",
             "type": "string",
             "_special": "select_persona",
-            "hint": "从 AstrBot WebUI 人格管理页面中已创建的人格列表中选择"
+            "hint": "匹配成功时使用的人格（将完全替换人格设置）"
           },
           "provider_id": {
             "description": "该人格使用的对话模型配置",
             "type": "string",
             "_special": "select_provider",
-            "hint": "从 AstrBot 已配置的对话模型下拉列表中选择。这里选择的是用户已经配置好的 Provider 条目，通常已经包含对应模型信息；留空则跟随当前会话",
-            "default": ""
-          },
-          "persona_desc": {
-            "description": "人格描述（该人格的身份与能力）",
-            "type": "text",
-            "hint": "描述该人格的角色定位和能力特征。例如：专业的计算机领域从业者，具有调用本机 shell 的能力，擅长代码调试与系统管理",
-            "default": ""
-          },
-          "scenario_desc": {
-            "description": "使用该人格的情况（何时应该切换到此人格）",
-            "type": "text",
-            "hint": "描述什么样的用户消息应该触发切换到此人格。例如：用户发出相对严肃的任务请求、知识询问或命令指示时启用该人格",
+            "hint": "留空则跟随当前会话",
             "default": ""
           }
         }
