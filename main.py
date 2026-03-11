@@ -153,17 +153,23 @@ class DynamicPersonaPlugin(Star):
 
     @filter.on_waiting_llm_request()
     async def on_waiting_llm(self, event: AstrMessageEvent):
+        sender_id = event.get_sender_id()
+        logger.info(
+            "[DynamicPersona] on_waiting_llm triggered for sender=%s group=%s",
+            sender_id,
+            event.get_group_id() or "private",
+        )
         if not self._should_handle_event(event):
+            logger.info("[DynamicPersona] _should_handle_event returned False")
             return
 
         if await self._has_forced_persona_binding(event):
+            logger.info("[DynamicPersona] _has_forced_persona_binding returned True")
             return
 
         decision = self._match_sender_to_persona(event)
-        if decision is None:
-            return
-
         self._apply_decision_to_event(event, decision)
+        await self._update_session_persona(event, decision)
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -196,6 +202,8 @@ class DynamicPersonaPlugin(Star):
         return True
 
     async def _has_forced_persona_binding(self, event: AstrMessageEvent) -> bool:
+        if not event.is_private_chat():
+            return False
         try:
             from astrbot.api import sp
 
@@ -211,7 +219,7 @@ class DynamicPersonaPlugin(Star):
             persona_id = str(session_service_config.get("persona_id", "")).strip()
             if persona_id and persona_id != "[%None]" and persona_id != self._get_matched_persona_id(event):
                 logger.info(
-                    "[DynamicPersona] session %s already forced to persona %s, skip",
+                    "[DynamicPersona] private session %s already forced to persona %s, skip",
                     event.unified_msg_origin,
                     persona_id,
                 )
@@ -316,13 +324,62 @@ class DynamicPersonaPlugin(Star):
     def _apply_decision_to_event(
         self,
         event: AstrMessageEvent,
-        decision: PersonaDecision,
+        decision: PersonaDecision | None,
     ) -> None:
+        if decision is None:
+            return
         if decision.provider_id:
             event.set_extra("selected_provider", decision.provider_id)
         if decision.model_name:
             event.set_extra("selected_model", decision.model_name)
         event.set_extra(_EVENT_DECISION_KEY, decision.to_event_extra())
+
+    async def _update_session_persona(
+        self,
+        event: AstrMessageEvent,
+        decision: PersonaDecision | None,
+    ) -> None:
+        try:
+            from astrbot.api import sp
+
+            existing_config: dict = (
+                await sp.get_async(
+                    scope="umo",
+                    scope_id=str(event.unified_msg_origin),
+                    key="session_service_config",
+                    default={},
+                )
+                or {}
+            )
+
+            if decision is not None:
+                persona_id = decision.persona_id
+                existing_config["persona_id"] = persona_id
+                logger.info(
+                    "[DynamicPersona] set session %s persona to %s for sender %s",
+                    event.unified_msg_origin,
+                    persona_id,
+                    event.get_sender_id(),
+                )
+            else:
+                existing_config.pop("persona_id", None)
+                logger.info(
+                    "[DynamicPersona] clear session %s persona for sender %s (use default)",
+                    event.unified_msg_origin,
+                    event.get_sender_id(),
+                )
+
+            await sp.put_async(
+                scope="umo",
+                scope_id=str(event.unified_msg_origin),
+                key="session_service_config",
+                value=existing_config,
+            )
+        except Exception as exc:
+            logger.error(
+                "[DynamicPersona] failed to update session persona: %s",
+                exc,
+            )
 
     def _get_decision_from_event(
         self, event: AstrMessageEvent
