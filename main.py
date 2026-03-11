@@ -165,39 +165,6 @@ class DynamicPersonaPlugin(Star):
 
         self._apply_decision_to_event(event, decision)
 
-        await self._set_session_persona(event, decision.persona_id)
-
-    async def _set_session_persona(self, event: AstrMessageEvent, persona_id: str):
-        try:
-            from astrbot.api import sp
-
-            existing_config = (
-                await sp.get_async(
-                    scope="umo",
-                    scope_id=str(event.unified_msg_origin),
-                    key="session_service_config",
-                    default={},
-                )
-                or {}
-            )
-            existing_config["persona_id"] = persona_id
-            await sp.put_async(
-                scope="umo",
-                scope_id=str(event.unified_msg_origin),
-                key="session_service_config",
-                value=existing_config,
-            )
-            logger.info(
-                "[DynamicPersona] set session %s persona to %s",
-                event.unified_msg_origin,
-                persona_id,
-            )
-        except Exception as exc:
-            logger.error(
-                "[DynamicPersona] failed to set session persona: %s",
-                exc,
-            )
-
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         decision = self._get_decision_from_event(event)
