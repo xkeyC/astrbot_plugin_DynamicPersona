@@ -19,9 +19,6 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
-from astrbot.core.agent.tool import ToolSet
-from astrbot.core.persona_error_reply import set_persona_custom_error_message_on_event
-from astrbot.core.skills import SkillManager, build_skills_prompt
 
 
 _EVENT_DECISION_KEY = "dynamic_persona_decision"
@@ -97,15 +94,16 @@ class DynamicPersonaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._bindings_cache: list[PersonaBinding] | None = None
 
     async def initialize(self):
-        bindings = self._get_active_bindings()
+        self._bindings_cache = self._parse_bindings()
         logger.info(
             "[DynamicPersona] loaded enabled=%s bindings=%s",
             self.config.get("enabled", True),
-            len(bindings),
+            len(self._bindings_cache),
         )
-        for b in bindings:
+        for b in self._bindings_cache:
             cond_str = ", ".join(str(c) for c in b.conditions)
             logger.info(
                 "[DynamicPersona] rule '%s': [%s] -> %s",
@@ -114,130 +112,7 @@ class DynamicPersonaPlugin(Star):
                 b.persona_id,
             )
 
-    @filter.on_waiting_llm_request()
-    async def on_waiting_llm(self, event: AstrMessageEvent):
-        if not self._should_handle_event(event):
-            return
-
-        if await self._has_forced_persona_binding(event):
-            return
-
-        group_id = event.get_group_id() or ""
-        sender_id = event.get_sender_id() or ""
-        logger.info(
-            "[DynamicPersona] checking match: group=%s sender=%s",
-            group_id or "(private)",
-            sender_id,
-        )
-
-        decision = self._match_sender_to_persona(event)
-        if decision is None:
-            logger.info("[DynamicPersona] no match found, skip")
-            return
-
-        self._apply_decision_to_event(event, decision)
-
-    @filter.on_llm_request()
-    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        decision = self._get_decision_from_event(event)
-        if decision is None:
-            return
-
-        try:
-            persona = await self.context.persona_manager.get_persona(
-                decision.persona_id
-            )
-            if persona is None:
-                logger.warning(
-                    "[DynamicPersona] persona '%s' not found, skip",
-                    decision.persona_id,
-                )
-                return
-
-            await self._apply_full_persona(event, req, persona, decision)
-
-            logger.info(
-                "[DynamicPersona] applied persona=%s provider=%s model=%s",
-                decision.persona_id,
-                decision.provider_id or "(session-default)",
-                decision.model_name or "(provider-default)",
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error("[DynamicPersona] failed to apply persona: %s", exc)
-
-    async def _apply_full_persona(
-        self,
-        event: AstrMessageEvent,
-        req: ProviderRequest,
-        persona: Any,
-        decision: PersonaDecision,
-    ):
-        if req.conversation is not None:
-            req.conversation.persona_id = decision.persona_id
-
-        req.system_prompt = persona.system_prompt or ""
-
-        begin_dialogs = persona.begin_dialogs or []
-        if begin_dialogs:
-            if len(begin_dialogs) % 2 == 0:
-                bd_processed = []
-                user_turn = True
-                for dialog in begin_dialogs:
-                    bd_processed.append(
-                        {
-                            "role": "user" if user_turn else "assistant",
-                            "content": dialog,
-                            "_no_save": True,
-                        }
-                    )
-                    user_turn = not user_turn
-                req.contexts[:0] = bd_processed
-
-        tmgr = self.context.get_llm_tool_manager()
-        persona_tools = persona.tools
-        if persona_tools is None:
-            persona_toolset = tmgr.get_full_tool_set()
-            for tool in list(persona_toolset):
-                if not tool.active:
-                    persona_toolset.remove_tool(tool.name)
-        else:
-            persona_toolset = ToolSet()
-            if persona_tools:
-                for tool_name in persona_tools:
-                    tool = tmgr.get_func(tool_name)
-                    if tool and tool.active:
-                        persona_toolset.add_tool(tool)
-        req.func_tool = persona_toolset
-
-        persona_skills = persona.skills
-        if persona_skills is not None:
-            skill_manager = SkillManager()
-            skills = skill_manager.list_skills(active_only=True)
-            if persona_skills:
-                allowed = set(persona_skills)
-                skills = [skill for skill in skills if skill.name in allowed]
-            else:
-                skills = []
-            if skills:
-                req.system_prompt += f"\n{build_skills_prompt(skills)}\n"
-
-        custom_error_message = persona.custom_error_message
-        if custom_error_message:
-            set_persona_custom_error_message_on_event(event, custom_error_message)
-
-        if decision.model_name:
-            req.model = decision.model_name
-
-    def _should_handle_event(self, event: AstrMessageEvent) -> bool:
-        if not self.config.get("enabled", True):
-            return False
-        if not (event.message_str or "").strip() and not event.message_obj.message:
-            return False
-        return True
-
-    def _get_active_bindings(self) -> list[PersonaBinding]:
+    def _parse_bindings(self) -> list[PersonaBinding]:
         raw_bindings: list[dict[str, Any]] = self.config.get("persona_bindings", [])
         bindings: list[PersonaBinding] = []
         for item in raw_bindings:
@@ -271,6 +146,88 @@ class DynamicPersonaPlugin(Star):
             )
         return bindings
 
+    def _get_bindings(self) -> list[PersonaBinding]:
+        if self._bindings_cache is None:
+            self._bindings_cache = self._parse_bindings()
+        return self._bindings_cache
+
+    @filter.on_waiting_llm_request()
+    async def on_waiting_llm(self, event: AstrMessageEvent):
+        if not self._should_handle_event(event):
+            return
+
+        if await self._has_forced_persona_binding(event):
+            return
+
+        decision = self._match_sender_to_persona(event)
+        if decision is None:
+            return
+
+        self._apply_decision_to_event(event, decision)
+
+        await self._set_session_persona(event, decision.persona_id)
+
+    async def _set_session_persona(self, event: AstrMessageEvent, persona_id: str):
+        try:
+            from astrbot.api import sp
+
+            existing_config = (
+                await sp.get_async(
+                    scope="umo",
+                    scope_id=str(event.unified_msg_origin),
+                    key="session_service_config",
+                    default={},
+                )
+                or {}
+            )
+            existing_config["persona_id"] = persona_id
+            await sp.put_async(
+                scope="umo",
+                scope_id=str(event.unified_msg_origin),
+                key="session_service_config",
+                value=existing_config,
+            )
+            logger.info(
+                "[DynamicPersona] set session %s persona to %s",
+                event.unified_msg_origin,
+                persona_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[DynamicPersona] failed to set session persona: %s",
+                exc,
+            )
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        decision = self._get_decision_from_event(event)
+        if decision is None:
+            return
+
+        try:
+            if decision.provider_id:
+                event.set_extra("selected_provider", decision.provider_id)
+            if decision.model_name:
+                event.set_extra("selected_model", decision.model_name)
+
+            logger.info(
+                "[DynamicPersona] applied persona=%s provider=%s model=%s",
+                decision.persona_id,
+                decision.provider_id or "(session-default)",
+                decision.model_name or "(provider-default)",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[DynamicPersona] failed to apply persona: %s", exc)
+
+    def _should_handle_event(self, event: AstrMessageEvent) -> bool:
+        if not self.config.get("enabled", True):
+            return False
+        if not (event.message_str or "").strip() and not event.message_obj.message:
+            return False
+        return True
+
     async def _has_forced_persona_binding(self, event: AstrMessageEvent) -> bool:
         try:
             from astrbot.api import sp
@@ -285,7 +242,7 @@ class DynamicPersonaPlugin(Star):
                 or {}
             )
             persona_id = str(session_service_config.get("persona_id", "")).strip()
-            if persona_id and persona_id != "[%None]":
+            if persona_id and persona_id != "[%None]" and persona_id != self._get_matched_persona_id(event):
                 logger.info(
                     "[DynamicPersona] session %s already forced to persona %s, skip",
                     event.unified_msg_origin,
@@ -301,8 +258,22 @@ class DynamicPersonaPlugin(Star):
             )
         return False
 
+    def _get_matched_persona_id(self, event: AstrMessageEvent) -> str | None:
+        bindings = self._get_bindings()
+        if not bindings:
+            return None
+
+        group_id = event.get_group_id() or ""
+        sender_id = event.get_sender_id() or ""
+
+        for binding in bindings:
+            for cond in binding.conditions:
+                if self._check_condition_match(cond, group_id, sender_id):
+                    return binding.persona_id
+        return None
+
     def _match_sender_to_persona(self, event: AstrMessageEvent) -> PersonaDecision | None:
-        bindings = self._get_active_bindings()
+        bindings = self._get_bindings()
         if not bindings:
             return None
 
@@ -410,7 +381,7 @@ class DynamicPersonaPlugin(Star):
     @dp.command("status")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def dp_status(self, event: AstrMessageEvent):
-        bindings = self._get_active_bindings()
+        bindings = self._get_bindings()
         group_id = event.get_group_id() or "private"
         sender_id = event.get_sender_id() or "unknown"
 
@@ -458,4 +429,5 @@ class DynamicPersonaPlugin(Star):
         yield event.plain_result("动态人格已禁用。")
 
     async def terminate(self):
+        self._bindings_cache = None
         logger.info("[DynamicPersona] terminated")
