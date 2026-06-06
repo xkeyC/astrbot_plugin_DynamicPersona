@@ -2,6 +2,8 @@
 
 `astrbot_plugin_DynamicPersona` 是一个 AstrBot 插件。
 
+> 本插件仅支持 xkeyC Fork 版 AstrBot。它依赖 Fork 版新增的事件级 LLM override API（`AstrMessageEvent.set_llm_overrides()`），官方上游 AstrBot 不保证可用。
+
 > Fork 自 [KirisameLonnet/astrbot_plugin_DynamicPersona](https://github.com/KirisameLonnet/astrbot_plugin_DynamicPersona)
 > 
 > 原版使用 LLM 动态决定人格，本 fork 改为基于用户关系表的配置方式，用于控制 MCP tools 的权限，或针对某一组（或单个）用户使用特定的人格。
@@ -12,7 +14,9 @@
 - 简洁的多行匹配条件格式
 - **完全替换人格设置**：包括 system_prompt、tools、skills、begin_dialogs、custom_error_message 等
 - 可用于控制 MCP tools 的权限（通过人格的 tools 配置）
-- 切换人格时可同步切换到该人格绑定的对话模型配置
+- 切换人格时可选同步切换到该人格绑定的对话模型配置
+- 使用事件级人格/模型覆盖，不会写入 `session_service_config.persona_id`，避免同一会话并发消息互相污染人格
+- 未配置 `provider_id` 的规则只切换人格，不覆盖其他插件或会话选择的模型
 
 ## 匹配格式
 
@@ -169,6 +173,7 @@ p_33333333
 - 如果当前会话被 AstrBot 的会话规则强制绑定人格，插件会默认跳过
 - 规则按顺序匹配，首次匹配成功即停止
 - 本插件依赖 AstrBot 现有的人格与 Provider 配置能力
+- 本插件依赖 xkeyC Fork 版 AstrBot 的 `AstrMessageEvent.set_llm_overrides()`；官方版 AstrBot 不支持此插件当前实现
 
 ## 排错
 
@@ -191,3 +196,4 @@ p_33333333
 ## 版本说明
 
 - **v3.0.0**：Fork 自原版，移除 LLM 动态选择功能，改为基于用户关系表的配置方式，支持简洁的多行匹配条件格式，完全替换人格设置
+- **v3.1.0**：改用 xkeyC Fork 版 AstrBot 的事件级 LLM override API，避免通过 session 配置切换人格导致并发串人格

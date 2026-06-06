@@ -20,7 +20,6 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 
-
 _EVENT_DECISION_KEY = "dynamic_persona_decision"
 
 
@@ -88,7 +87,7 @@ def parse_match_condition(line: str) -> MatchCondition | None:
     "astrbot_plugin_DynamicPersona",
     "xkeyC",
     "基于发送者ID的动态人格插件，支持群组/个人配置，可为不同用户绑定不同人格",
-    "3.0.0",
+    "3.1.0",
 )
 class DynamicPersonaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -169,7 +168,6 @@ class DynamicPersonaPlugin(Star):
 
         decision = self._match_sender_to_persona(event)
         self._apply_decision_to_event(event, decision)
-        await self._update_session_persona(event, decision)
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -178,11 +176,6 @@ class DynamicPersonaPlugin(Star):
             return
 
         try:
-            if decision.provider_id:
-                event.set_extra("selected_provider", decision.provider_id)
-            if decision.model_name:
-                event.set_extra("selected_model", decision.model_name)
-
             logger.info(
                 "[DynamicPersona] applied persona=%s provider=%s model=%s",
                 decision.persona_id,
@@ -217,7 +210,11 @@ class DynamicPersonaPlugin(Star):
                 or {}
             )
             persona_id = str(session_service_config.get("persona_id", "")).strip()
-            if persona_id and persona_id != "[%None]" and persona_id != self._get_matched_persona_id(event):
+            if (
+                persona_id
+                and persona_id != "[%None]"
+                and persona_id != self._get_matched_persona_id(event)
+            ):
                 logger.info(
                     "[DynamicPersona] private session %s already forced to persona %s, skip",
                     event.unified_msg_origin,
@@ -247,7 +244,9 @@ class DynamicPersonaPlugin(Star):
                     return binding.persona_id
         return None
 
-    def _match_sender_to_persona(self, event: AstrMessageEvent) -> PersonaDecision | None:
+    def _match_sender_to_persona(
+        self, event: AstrMessageEvent
+    ) -> PersonaDecision | None:
         bindings = self._get_bindings()
         if not bindings:
             return None
@@ -264,7 +263,7 @@ class DynamicPersonaPlugin(Star):
                         str(cond),
                         binding.persona_id,
                     )
-                    return self._build_decision_from_binding(binding, event)
+                    return self._build_decision_from_binding(binding)
 
         return None
 
@@ -285,7 +284,6 @@ class DynamicPersonaPlugin(Star):
     def _build_decision_from_binding(
         self,
         binding: PersonaBinding,
-        event: AstrMessageEvent,
     ) -> PersonaDecision:
         provider_id = ""
         model_name = ""
@@ -302,24 +300,12 @@ class DynamicPersonaPlugin(Star):
                     binding.persona_id,
                 )
 
-        if not provider_id:
-            provider_id = self._get_current_chat_provider_id(event)
-            if provider_id:
-                provider = self.context.get_provider_by_id(provider_id)
-                model_name = getattr(provider, "get_model", lambda: "")() or ""
-
         return PersonaDecision(
             persona_id=binding.persona_id,
             provider_id=provider_id,
             model_name=model_name,
             source="sender_mapping",
         )
-
-    def _get_current_chat_provider_id(self, event: AstrMessageEvent) -> str:
-        try:
-            return self.context.get_using_provider(umo=event.unified_msg_origin).id
-        except Exception:
-            return ""
 
     def _apply_decision_to_event(
         self,
@@ -328,58 +314,13 @@ class DynamicPersonaPlugin(Star):
     ) -> None:
         if decision is None:
             return
+        event.set_selected_persona(decision.persona_id)
         if decision.provider_id:
-            event.set_extra("selected_provider", decision.provider_id)
-        if decision.model_name:
-            event.set_extra("selected_model", decision.model_name)
+            event.set_selected_provider(
+                decision.provider_id,
+                decision.model_name or None,
+            )
         event.set_extra(_EVENT_DECISION_KEY, decision.to_event_extra())
-
-    async def _update_session_persona(
-        self,
-        event: AstrMessageEvent,
-        decision: PersonaDecision | None,
-    ) -> None:
-        try:
-            from astrbot.api import sp
-
-            existing_config: dict = (
-                await sp.get_async(
-                    scope="umo",
-                    scope_id=str(event.unified_msg_origin),
-                    key="session_service_config",
-                    default={},
-                )
-                or {}
-            )
-
-            if decision is not None:
-                persona_id = decision.persona_id
-                existing_config["persona_id"] = persona_id
-                logger.info(
-                    "[DynamicPersona] set session %s persona to %s for sender %s",
-                    event.unified_msg_origin,
-                    persona_id,
-                    event.get_sender_id(),
-                )
-            else:
-                existing_config.pop("persona_id", None)
-                logger.info(
-                    "[DynamicPersona] clear session %s persona for sender %s (use default)",
-                    event.unified_msg_origin,
-                    event.get_sender_id(),
-                )
-
-            await sp.put_async(
-                scope="umo",
-                scope_id=str(event.unified_msg_origin),
-                key="session_service_config",
-                value=existing_config,
-            )
-        except Exception as exc:
-            logger.error(
-                "[DynamicPersona] failed to update session persona: %s",
-                exc,
-            )
 
     def _get_decision_from_event(
         self, event: AstrMessageEvent

@@ -7,7 +7,7 @@
   "persona_bindings": {
     "description": "人格绑定规则",
     "type": "template_list",
-    "hint": "配置匹配条件与人格的绑定关系。匹配成功后将完全替换人格设置（包括 tools、skills、begin_dialogs、custom_error_message 等）",
+    "hint": "仅支持 xkeyC Fork 版 AstrBot。配置匹配条件与人格的绑定关系。匹配成功后将通过事件级 override 完全替换人格设置（包括 tools、skills、begin_dialogs、custom_error_message 等）",
     "templates": {
       "binding_rule": {
         "name": "绑定规则",
