@@ -87,7 +87,7 @@ def parse_match_condition(line: str) -> MatchCondition | None:
     "astrbot_plugin_DynamicPersona",
     "xkeyC",
     "基于发送者ID的动态人格插件，支持群组/个人配置，可为不同用户绑定不同人格",
-    "3.1.0",
+    "3.1.1",
 )
 class DynamicPersonaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -349,6 +349,32 @@ class DynamicPersonaPlugin(Star):
         bindings = self._get_bindings()
         group_id = event.get_group_id() or "private"
         sender_id = event.get_sender_id() or "unknown"
+        matched_persona_id = self._get_matched_persona_id(event) or "(none)"
+        forced_persona_id = "(none)"
+        try:
+            from astrbot.api import sp
+
+            session_service_config = (
+                await sp.get_async(
+                    scope="umo",
+                    scope_id=str(event.unified_msg_origin),
+                    key="session_service_config",
+                    default={},
+                )
+                or {}
+            )
+            forced_persona_id = (
+                str(session_service_config.get("persona_id", "")).strip()
+                or "(none)"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[DynamicPersona] failed to inspect session persona for status: %s",
+                exc,
+            )
+            forced_persona_id = "(read failed)"
 
         lines = [
             "DynamicPersona 状态",
@@ -356,6 +382,8 @@ class DynamicPersonaPlugin(Star):
             f"active_bindings: {len(bindings)}",
             f"current_group: {group_id}",
             f"current_sender: {sender_id}",
+            f"matched_persona: {matched_persona_id}",
+            f"forced_session_persona: {forced_persona_id}",
             "",
             "已配置规则:",
         ]
@@ -392,6 +420,36 @@ class DynamicPersonaPlugin(Star):
         self.config["enabled"] = False
         self.config.save_config()
         yield event.plain_result("动态人格已禁用。")
+
+    @dp.command("clear_session_persona")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def dp_clear_session_persona(self, event: AstrMessageEvent):
+        from astrbot.api import sp
+
+        session_service_config = (
+            await sp.get_async(
+                scope="umo",
+                scope_id=str(event.unified_msg_origin),
+                key="session_service_config",
+                default={},
+            )
+            or {}
+        )
+        removed_persona_id = str(
+            session_service_config.pop("persona_id", "")
+        ).strip()
+        await sp.put_async(
+            scope="umo",
+            scope_id=str(event.unified_msg_origin),
+            key="session_service_config",
+            value=session_service_config,
+        )
+        if removed_persona_id:
+            yield event.plain_result(
+                f"已清除当前会话的强制人格：{removed_persona_id}。"
+            )
+        else:
+            yield event.plain_result("当前会话没有强制人格，无需清理。")
 
     async def terminate(self):
         self._bindings_cache = None

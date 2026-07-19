@@ -165,6 +165,7 @@ p_33333333
 - `/dp enable`：启用插件
 - `/dp disable`：禁用插件
 - `/dp sessionid`：查看当前会话相关 ID 及匹配格式提示
+- `/dp clear_session_persona`：清除当前会话遗留或手工设置的强制人格
 
 其中部分命令需要管理员权限。
 
@@ -184,6 +185,8 @@ p_33333333
 - 插件是否启用
 - `persona_id` 是否在 AstrBot 中真实存在
 - 当前会话是否被会话规则强制绑定了固定人格
+- 使用 `/dp status` 对比 `matched_persona` 与 `forced_session_persona`；后者优先级更高
+- 如果 `forced_session_persona` 是旧版本插件遗留值，使用 `/dp clear_session_persona` 清除
 - 匹配条件格式是否正确（使用 `/dp sessionid` 查看当前 ID）
 
 ### 没有发生模型切换
@@ -197,3 +200,4 @@ p_33333333
 
 - **v3.0.0**：Fork 自原版，移除 LLM 动态选择功能，改为基于用户关系表的配置方式，支持简洁的多行匹配条件格式，完全替换人格设置
 - **v3.1.0**：改用 xkeyC Fork 版 AstrBot 的事件级 LLM override API，避免通过 session 配置切换人格导致并发串人格
+- **v3.1.1**：状态命令显示会话强制人格，并支持按当前会话清理旧版本遗留的人格绑定

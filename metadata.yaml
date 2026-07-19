@@ -1,6 +1,6 @@
 name: astrbot_plugin_DynamicPersona
 display_name: 动态人格
 desc: 基于发送者 ID 的动态人格插件，支持群组/个人配置，可为不同用户绑定不同人格
-version: v3.1.0
+version: v3.1.1
 author: xkeyC
 repo: https://github.com/xkeyC/astrbot_plugin_DynamicPersona
